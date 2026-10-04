@@ -11,6 +11,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
+import kotlinx.coroutines.*
 
 class LanFileServerService : Service() {
 
@@ -39,10 +40,85 @@ class LanFileServerService : Service() {
             }
             context.startService(intent)
         }
+
+        fun updateNotification(
+            context: Context,
+            url: String,
+            clients: Int,
+            port: Int = 8080,
+            clientIps: List<String> = emptyList()
+        ) {
+            try {
+                val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                val notification = buildNotificationStatic(context, url, clients, port, clientIps)
+                notificationManager?.notify(NOTIFICATION_ID, notification)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to update notification directly", e)
+            }
+        }
+
+        fun buildNotificationStatic(
+            context: Context,
+            url: String,
+            clients: Int,
+            port: Int,
+            clientIps: List<String> = emptyList()
+        ): Notification {
+            val openAppIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            val openAppPendingIntent = PendingIntent.getActivity(
+                context,
+                0,
+                openAppIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val stopIntent = Intent(context, LanFileServerService::class.java).apply {
+                action = ACTION_STOP
+            }
+            val stopPendingIntent = PendingIntent.getService(
+                context,
+                1,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val displayUrl = if (url.isNotEmpty()) url else "http://0.0.0.0:$port/"
+            val clientStatusText = "Ulangan mijozlar: $clients ta"
+            val clientDetails = if (clientIps.isNotEmpty()) {
+                val ipsFormatted = clientIps.take(3).joinToString(", ")
+                val more = if (clientIps.size > 3) " (+${clientIps.size - 3})" else ""
+                "\nUlangan qurilmalar: $ipsFormatted$more"
+            } else {
+                "\nUlangan qurilmalar: Faol qurilmalar kutilmoqda"
+            }
+
+            return NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_upload)
+                .setContentTitle("Super Terminal: LAN File Server")
+                .setContentText("● Faol: $displayUrl | $clientStatusText")
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText("LAN File Server $port-portda faol ishlamoqda.\nManzil: $displayUrl\n$clientStatusText$clientDetails")
+                )
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setContentIntent(openAppPendingIntent)
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Serverni To'xtatish",
+                    stopPendingIntent
+                )
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var statsCollectorJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -50,6 +126,20 @@ class LanFileServerService : Service() {
         super.onCreate()
         createNotificationChannel()
         acquireLocks()
+        startObservingStats()
+    }
+
+    private fun startObservingStats() {
+        statsCollectorJob?.cancel()
+        statsCollectorJob = serviceScope.launch {
+            LanFileServerManager.getInstance(applicationContext).serverStats.collect { stats ->
+                val manager = LanFileServerManager.getInstance(applicationContext)
+                if (manager.serverState.value == LanServerState.RUNNING) {
+                    val port = manager.serverConfig.value.port
+                    updateNotification(applicationContext, stats.fullUrl, stats.activeClients, port, stats.clientIps)
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -62,9 +152,16 @@ class LanFileServerService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START, null -> {
-                val notification = buildNotification(
-                    url = LanFileServerManager.getInstance(applicationContext).serverStats.value.fullUrl,
-                    clients = LanFileServerManager.getInstance(applicationContext).serverStats.value.activeClients
+                startObservingStats()
+                val manager = LanFileServerManager.getInstance(applicationContext)
+                val currentStats = manager.serverStats.value
+                val port = manager.serverConfig.value.port
+                val notification = buildNotificationStatic(
+                    context = this,
+                    url = currentStats.fullUrl,
+                    clients = currentStats.activeClients,
+                    port = port,
+                    clientIps = currentStats.clientIps
                 )
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -85,54 +182,6 @@ class LanFileServerService : Service() {
             }
         }
         return START_STICKY
-    }
-
-    fun updateNotification(url: String, clients: Int) {
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-        val notification = buildNotification(url, clients)
-        notificationManager?.notify(NOTIFICATION_ID, notification)
-    }
-
-    private fun buildNotification(url: String, clients: Int): Notification {
-        val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val openAppPendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            openAppIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val stopIntent = Intent(this, LanFileServerService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val displayUrl = if (url.isNotEmpty()) url else "http://0.0.0.0:8080/"
-
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("Super Terminal: LAN File Server")
-            .setContentText("● Faol: $displayUrl | Ulanganlar: $clients ta")
-            .setStyle(
-                NotificationCompat.BigTextStyle()
-                    .bigText("LAN File Server 8080-portda faol ishlamoqda.\nManzil: $displayUrl\nUlangan mijozlar: $clients ta")
-            )
-            .setOngoing(true)
-            .setContentIntent(openAppPendingIntent)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Serverni To'xtatish",
-                stopPendingIntent
-            )
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
     }
 
     private fun createNotificationChannel() {
@@ -174,6 +223,8 @@ class LanFileServerService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        statsCollectorJob?.cancel()
+        serviceScope.cancel()
         try {
             if (wakeLock?.isHeld == true) wakeLock?.release()
             wakeLock = null

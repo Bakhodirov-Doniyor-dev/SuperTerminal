@@ -47,7 +47,7 @@ class LanFileServer(
     var sharedDirectory: File = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
     var isAuthEnabled: Boolean = true,
     var authToken: String = generateSecureToken(),
-    private val onStatsUpdated: ((activeClients: Int, downloaded: Long, uploaded: Long) -> Unit)? = null,
+    private val onStatsUpdated: ((activeClients: Int, clientIps: List<String>, downloaded: Long, uploaded: Long) -> Unit)? = null,
     private val onLog: ((LanAccessLog) -> Unit)? = null
 ) {
     companion object {
@@ -87,22 +87,80 @@ class LanFileServer(
     private var workerExecutor: ExecutorService? = null
     private var acceptThread: Thread? = null
 
+    data class ClientSession(
+        val ip: String,
+        val firstSeenMs: Long = System.currentTimeMillis(),
+        @Volatile var lastActiveMs: Long = System.currentTimeMillis(),
+        val inFlightSockets: AtomicInteger = AtomicInteger(1)
+    )
+
+    private val clientSessions = ConcurrentHashMap<String, ClientSession>()
     val activeClients = AtomicInteger(0)
     val totalBytesDownloaded = AtomicLong(0)
     val totalBytesUploaded = AtomicLong(0)
-    val recentClientIps = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val lastNotifyTime = AtomicLong(0L)
     var startTimeMs: Long = 0L
         private set
 
-    fun getActiveClientCount(): Int {
-        val cutoff = System.currentTimeMillis() - 60_000L
-        recentClientIps.entries.removeIf { it.value < cutoff }
-        return recentClientIps.size.coerceAtLeast(activeClients.get())
+    fun cleanClientIp(rawIp: String): String {
+        val unmapped = if (rawIp.startsWith("::ffff:")) rawIp.removePrefix("::ffff:") else rawIp
+        val withoutScope = if (unmapped.contains("%")) unmapped.substringBefore("%") else unmapped
+        return when (withoutScope.trim()) {
+            "0:0:0:0:0:0:0:1", "::1", "127.0.0.1" -> "127.0.0.1"
+            else -> withoutScope.trim()
+        }
     }
 
-    private fun notifyStats() {
+    fun getActiveClientDetails(): Pair<Int, List<String>> {
+        val now = System.currentTimeMillis()
+        val cutoff = now - 60_000L // 60 seconds lease
+        clientSessions.entries.removeIf { (_, session) ->
+            session.inFlightSockets.get() <= 0 && session.lastActiveMs < cutoff
+        }
+        val activeIps = clientSessions.keys.toList()
+        return activeIps.size to activeIps
+    }
+
+    fun getActiveClientCount(): Int = getActiveClientDetails().first
+
+    fun registerClientConnection(clientIp: String) {
+        clientSessions.compute(clientIp) { _, existing ->
+            if (existing == null) {
+                ClientSession(ip = clientIp, inFlightSockets = AtomicInteger(1))
+            } else {
+                existing.lastActiveMs = System.currentTimeMillis()
+                existing.inFlightSockets.incrementAndGet()
+                existing
+            }
+        }
+        activeClients.set(getActiveClientCount())
+        notifyStats(force = true)
+    }
+
+    fun unregisterClientSocket(clientIp: String) {
+        val session = clientSessions[clientIp]
+        if (session != null) {
+            session.lastActiveMs = System.currentTimeMillis()
+            val remaining = session.inFlightSockets.decrementAndGet()
+            if (remaining < 0) {
+                session.inFlightSockets.set(0)
+            }
+        }
+        activeClients.set(getActiveClientCount())
+        notifyStats(force = false)
+    }
+
+    private fun notifyStats(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val last = lastNotifyTime.get()
+        if (!force && (now - last) < 30L) {
+            return
+        }
+        lastNotifyTime.set(now)
+        val (count, clientIps) = getActiveClientDetails()
         onStatsUpdated?.invoke(
-            getActiveClientCount(),
+            count,
+            clientIps,
             totalBytesDownloaded.get(),
             totalBytesUploaded.get()
         )
@@ -151,8 +209,16 @@ class LanFileServer(
                     try {
                         val clientSocket = socket.accept()
                         clientSocket.soTimeout = 30000 // 30 sec timeout
+                        val rawIp = clientSocket.inetAddress?.hostAddress
+                            ?: (clientSocket.remoteSocketAddress as? InetSocketAddress)?.address?.hostAddress
+                            ?: "Client"
+                        val clientIp = cleanClientIp(rawIp)
+
+                        // Instantly register client connection in 0.001s upon socket accept!
+                        registerClientConnection(clientIp)
+
                         workerExecutor?.submit {
-                            handleClient(clientSocket)
+                            handleClient(clientSocket, clientIp)
                         }
                     } catch (e: SocketException) {
                         if (!isRunning.get()) break
@@ -193,19 +259,16 @@ class LanFileServer(
         workerExecutor = null
 
         activeClients.set(0)
-        recentClientIps.clear()
+        clientSessions.clear()
+        notifyStats(force = true)
         logI(TAG, "LanFileServer successfully stopped")
     }
 
     fun isServerRunning(): Boolean = isRunning.get() && serverSocket?.isBound == true && serverSocket?.isClosed == false
 
-    private fun handleClient(clientSocket: Socket) {
-        val clientIp = (clientSocket.remoteSocketAddress as? InetSocketAddress)?.address?.hostAddress ?: "Unknown"
-        if (clientIp != "Unknown" && !clientIp.startsWith("127.")) {
-            recentClientIps[clientIp] = System.currentTimeMillis()
-        }
-        activeClients.incrementAndGet()
-        notifyStats()
+    private fun handleClient(clientSocket: Socket, clientIp: String) {
+        // Touch last active timestamp for this client
+        clientSessions[clientIp]?.lastActiveMs = System.currentTimeMillis()
 
         try {
             val input = BufferedInputStream(clientSocket.getInputStream())
@@ -255,6 +318,10 @@ class LanFileServer(
                     if (method == "POST" && path == "/api/login") {
                         handleLoginPost(input, output, headers, clientIp)
                         return
+                    } else if (path == "/api/heartbeat") {
+                        // Allow heartbeat pulse even on login page so connecting device is instantly tracked!
+                        handleHeartbeat(output, clientIp)
+                        return
                     } else {
                         // Serve Login Page
                         serveLoginPage(output, clientIp)
@@ -272,6 +339,9 @@ class LanFileServer(
                         }
                         path == "/api/heartbeat" -> {
                             handleHeartbeat(output, clientIp)
+                        }
+                        path == "/api/leave" -> {
+                            handleLeave(output, clientIp)
                         }
                         path == "/api/storage-info" -> {
                             handleStorageInfo(output, clientIp)
@@ -291,6 +361,9 @@ class LanFileServer(
                         path == "/api/upload" -> {
                             val targetSubDir = queryParams["dir"] ?: ""
                             handleFileUpload(input, output, headers, targetSubDir, clientIp)
+                        }
+                        path == "/api/leave" -> {
+                            handleLeave(output, clientIp)
                         }
                         else -> {
                             sendSimpleResponse(output, 404, "Not Found", "Endpoint not found")
@@ -314,8 +387,7 @@ class LanFileServer(
         } catch (e: Exception) {
             logE(TAG, "Error handling client request from $clientIp", e)
         } finally {
-            activeClients.decrementAndGet()
-            notifyStats()
+            unregisterClientSocket(clientIp)
             try {
                 clientSocket.close()
             } catch (e: Exception) {
@@ -408,6 +480,8 @@ class LanFileServer(
     }
 
     private fun handleLogout(output: OutputStream, clientIp: String) {
+        clientSessions.remove(clientIp)
+        notifyStats(force = true)
         val response = "HTTP/1.1 303 See Other\r\n" +
                 "Location: /\r\n" +
                 "Set-Cookie: lan_session=deleted; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT\r\n" +
@@ -419,10 +493,23 @@ class LanFileServer(
     }
 
     private fun handleHeartbeat(output: OutputStream, clientIp: String) {
-        recentClientIps[clientIp] = System.currentTimeMillis()
-        notifyStats()
-        sendJsonResponse(output, 200, "{\"status\":\"ok\",\"clients\":${getActiveClientCount()}}")
+        clientSessions.compute(clientIp) { _, existing ->
+            if (existing == null) {
+                ClientSession(ip = clientIp, inFlightSockets = AtomicInteger(0))
+            } else {
+                existing.lastActiveMs = System.currentTimeMillis()
+                existing
+            }
+        }
+        notifyStats(force = false)
+        val (count, _) = getActiveClientDetails()
+        sendJsonResponse(output, 200, "{\"status\":\"ok\",\"clients\":$count}")
         logRequest(clientIp, "GET", "/api/heartbeat", 200, 0)
+    }
+
+    private fun handleLeave(output: OutputStream, clientIp: String) {
+        sendJsonResponse(output, 200, "{\"status\":\"ok\"}")
+        logRequest(clientIp, "POST", "/api/leave", 200, 0)
     }
 
     /**
@@ -1161,6 +1248,13 @@ class LanFileServer(
                 this.value = formatted;
             });
         }
+
+        // Live connection heartbeat immediately on load & every 1.5 seconds
+        function pingServer() {
+            fetch('/api/heartbeat', { cache: 'no-store' }).catch(function() {});
+        }
+        pingServer();
+        setInterval(pingServer, 1500);
     </script>
 </body>
 </html>
@@ -1752,10 +1846,14 @@ class LanFileServer(
             uploadNext();
         }
 
-        // Live client active heartbeat every 10 seconds
-        setInterval(function() {
-            fetch('/api/heartbeat').catch(function() {});
-        }, 10000);
+        // Live client active heartbeat immediately on load & every 1.5 seconds
+        var AUTH_TOKEN = '${escapeHtml(authToken)}';
+        function pingServer() {
+            var url = '/api/heartbeat' + (AUTH_TOKEN ? '?token=' + encodeURIComponent(AUTH_TOKEN) : '');
+            fetch(url, { cache: 'no-store' }).catch(function() {});
+        }
+        pingServer();
+        setInterval(pingServer, 1500);
     </script>
 </body>
 </html>

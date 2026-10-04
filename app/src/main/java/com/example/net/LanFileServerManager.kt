@@ -40,6 +40,7 @@ data class LanServerStats(
     val port: Int = 8080,
     val fullUrl: String = "",
     val activeClients: Int = 0,
+    val clientIps: List<String> = emptyList(),
     val bytesDownloaded: Long = 0L,
     val bytesUploaded: Long = 0L,
     val uptimeSeconds: Long = 0L,
@@ -130,14 +131,18 @@ class LanFileServerManager private constructor(private val appContext: Context) 
                     sharedDirectory = sharedDir,
                     isAuthEnabled = _serverConfig.value.isAuthEnabled,
                     authToken = _serverConfig.value.authToken,
-                    onStatsUpdated = { clients, down, up ->
-                        scope.launch(Dispatchers.Main) {
-                            _serverStats.value = _serverStats.value.copy(
-                                activeClients = clients,
-                                bytesDownloaded = down,
-                                bytesUploaded = up
-                            )
-                        }
+                    onStatsUpdated = { clients, clientIps, down, up ->
+                        val port = _serverConfig.value.port
+                        val currentUrl = _serverStats.value.fullUrl
+                        val effectiveUrl = if (currentUrl.isNotEmpty()) currentUrl else "http://${getPrimaryLanIp() ?: "127.0.0.1"}:$port/"
+                        _serverStats.value = _serverStats.value.copy(
+                            activeClients = clients,
+                            clientIps = clientIps,
+                            bytesDownloaded = down,
+                            bytesUploaded = up
+                        )
+                        // Synchronously push update to Android notification shade in < 0.005s!
+                        LanFileServerService.updateNotification(appContext, effectiveUrl, clients, port, clientIps)
                     },
                     onLog = { log ->
                         addLog(log)
@@ -170,6 +175,7 @@ class LanFileServerManager private constructor(private val appContext: Context) 
                         port = portToUse,
                         fullUrl = "http://$primaryIp:$portToUse/",
                         activeClients = 0,
+                        clientIps = emptyList(),
                         bytesDownloaded = 0L,
                         bytesUploaded = 0L,
                         uptimeSeconds = 0L,
@@ -219,7 +225,8 @@ class LanFileServerManager private constructor(private val appContext: Context) 
             withContext(Dispatchers.Main) {
                 _serverState.value = LanServerState.STOPPED
                 _serverStats.value = _serverStats.value.copy(
-                    activeClients = 0
+                    activeClients = 0,
+                    clientIps = emptyList()
                 )
                 LanFileServerService.stopService(appContext)
                 addLog(
@@ -380,13 +387,19 @@ class LanFileServerManager private constructor(private val appContext: Context) 
         val start = System.currentTimeMillis()
         uptimeJob = scope.launch(Dispatchers.Default) {
             while (isActive && _serverState.value == LanServerState.RUNNING) {
-                delay(1000)
+                delay(500) // Fast 0.5s background pulse
                 val elapsedSec = (System.currentTimeMillis() - start) / 1000
-                val currentClients = activeServer?.getActiveClientCount() ?: 0
-                _serverStats.value = _serverStats.value.copy(
+                val (currentClients, currentIps) = activeServer?.getActiveClientDetails() ?: (0 to emptyList())
+                val prev = _serverStats.value
+                val updated = prev.copy(
                     activeClients = currentClients,
+                    clientIps = currentIps,
                     uptimeSeconds = elapsedSec
                 )
+                _serverStats.value = updated
+                if (prev.activeClients != currentClients || prev.clientIps != currentIps) {
+                    LanFileServerService.updateNotification(appContext, updated.fullUrl, currentClients, updated.port, currentIps)
+                }
             }
         }
     }

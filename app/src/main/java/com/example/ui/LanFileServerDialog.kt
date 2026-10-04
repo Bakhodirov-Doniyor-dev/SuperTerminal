@@ -849,6 +849,35 @@ private fun RuntimeStatsGrid(
             )
         }
 
+        if (serverStats.clientIps.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF0F172A).copy(alpha = 0.65f))
+                    .border(BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.35f)), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(Color(0xFF10B981))
+                )
+                Text(
+                    text = "Ulangan: ${serverStats.clientIps.joinToString(", ")}",
+                    fontSize = 11.sp,
+                    color = Color(0xFF38BDF8),
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
