@@ -95,6 +95,7 @@ class LanFileServer(
     )
 
     private val clientSessions = ConcurrentHashMap<String, ClientSession>()
+    private val openClientSockets = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
     val activeClients = AtomicInteger(0)
     val totalBytesDownloaded = AtomicLong(0)
     val totalBytesUploaded = AtomicLong(0)
@@ -189,11 +190,41 @@ class LanFileServer(
             sharedDirectory.mkdirs()
         }
 
+        var bindAttempts = 0
+        var bound = false
+        var lastBindException: Exception? = null
+
+        // Smart retry with SO_REUSEADDR allows instant restart without TIME_WAIT conflicts
+        while (bindAttempts < 5 && !bound) {
+            try {
+                bindAttempts++
+                val socket = ServerSocket()
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress("0.0.0.0", port), 50)
+                serverSocket = socket
+                bound = true
+            } catch (e: BindException) {
+                lastBindException = e
+                if (bindAttempts < 5) {
+                    try {
+                        Thread.sleep(120L)
+                    } catch (ie: InterruptedException) {
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                lastBindException = e
+                break
+            }
+        }
+
+        if (!bound) {
+            isRunning.set(false)
+            val detail = lastBindException?.message ?: "Band"
+            throw BindException("Port $port band (boshqa dastur yoki avvalgi ulanish tomonidan band qilingan). $detail")
+        }
+
         try {
-            val socket = ServerSocket()
-            socket.reuseAddress = true
-            socket.bind(InetSocketAddress("0.0.0.0", port))
-            serverSocket = socket
             isRunning.set(true)
             startTimeMs = System.currentTimeMillis()
 
@@ -205,10 +236,13 @@ class LanFileServer(
 
             acceptThread = Thread({
                 logI(TAG, "LanFileServer started on port $port bound to 0.0.0.0")
-                while (isRunning.get() && !socket.isClosed) {
+                while (isRunning.get() && serverSocket?.isClosed == false) {
                     try {
+                        val socket = serverSocket ?: break
                         val clientSocket = socket.accept()
                         clientSocket.soTimeout = 30000 // 30 sec timeout
+                        openClientSockets.add(clientSocket)
+
                         val rawIp = clientSocket.inetAddress?.hostAddress
                             ?: (clientSocket.remoteSocketAddress as? InetSocketAddress)?.address?.hostAddress
                             ?: "Client"
@@ -232,11 +266,10 @@ class LanFileServer(
                 isDaemon = true
                 start()
             }
-        } catch (e: BindException) {
-            isRunning.set(false)
-            throw BindException("Port $port band (boshqa dastur tomonidan band qilingan). Boshqa port tanlang.")
         } catch (e: Exception) {
             isRunning.set(false)
+            try { serverSocket?.close() } catch (ex: Exception) {}
+            serverSocket = null
             throw IOException("LAN Serverni ishga tushirishda xatolik: ${e.message}", e)
         }
     }
@@ -245,6 +278,7 @@ class LanFileServer(
     fun stop() {
         if (!isRunning.getAndSet(false)) return
 
+        // 1. Close ServerSocket first to prevent new incoming connections
         try {
             serverSocket?.close()
         } catch (e: Exception) {
@@ -252,16 +286,32 @@ class LanFileServer(
         }
         serverSocket = null
 
-        acceptThread?.interrupt()
+        // 2. Interrupt accept thread
+        try {
+            acceptThread?.interrupt()
+        } catch (e: Exception) {}
         acceptThread = null
 
-        workerExecutor?.shutdownNow()
+        // 3. Close ALL open active client sockets to immediately release port in OS kernel!
+        val socketsToClose = openClientSockets.toList()
+        for (clientSocket in socketsToClose) {
+            try {
+                clientSocket.close()
+            } catch (e: Exception) {}
+        }
+        openClientSockets.clear()
+
+        // 4. Shutdown worker thread pool
+        try {
+            workerExecutor?.shutdownNow()
+        } catch (e: Exception) {}
         workerExecutor = null
 
+        // 5. Reset client sessions and metrics
         activeClients.set(0)
         clientSessions.clear()
         notifyStats(force = true)
-        logI(TAG, "LanFileServer successfully stopped")
+        logI(TAG, "LanFileServer successfully stopped and all sockets freed")
     }
 
     fun isServerRunning(): Boolean = isRunning.get() && serverSocket?.isBound == true && serverSocket?.isClosed == false
@@ -387,6 +437,7 @@ class LanFileServer(
         } catch (e: Exception) {
             logE(TAG, "Error handling client request from $clientIp", e)
         } finally {
+            openClientSockets.remove(clientSocket)
             unregisterClientSocket(clientIp)
             try {
                 clientSocket.close()

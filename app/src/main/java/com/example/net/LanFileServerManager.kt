@@ -14,6 +14,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -86,6 +88,7 @@ class LanFileServerManager private constructor(private val appContext: Context) 
     private var activeServer: LanFileServer? = null
     private var uptimeJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val serverLifecycleMutex = Mutex()
 
     init {
         detectAllLanIps()
@@ -106,105 +109,106 @@ class LanFileServerManager private constructor(private val appContext: Context) 
         _serverStats.value = _serverStats.value.copy(errorMessage = null)
 
         scope.launch(Dispatchers.IO) {
-            try {
-                // 1. IP Detection
-                val primaryIp = getPrimaryLanIp()
-                if (primaryIp == null) {
-                    withContext(Dispatchers.Main) {
-                        _serverState.value = LanServerState.ERROR
-                        _serverStats.value = _serverStats.value.copy(
-                            errorMessage = "Faol LAN yoki Wi-Fi tarmog'i aniqlanmadi. Iltimos Wi-Fi yoki Hotspot tarmog'ini yoqing."
-                        )
+            serverLifecycleMutex.withLock {
+                try {
+                    // 0. Ensure any previous instance and ticker are completely shut down
+                    uptimeJob?.cancel()
+                    uptimeJob = null
+                    try {
+                        activeServer?.stop()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error cleaning previous activeServer", e)
                     }
-                    return@launch
-                }
+                    activeServer = null
 
-                // 2. Shared directory validation
-                val sharedDir = File(_serverConfig.value.sharedDirectoryPath)
-                if (!sharedDir.exists()) {
-                    sharedDir.mkdirs()
-                }
-
-                // 3. Create HTTP Server instance
-                val server = LanFileServer(
-                    port = portToUse,
-                    sharedDirectory = sharedDir,
-                    isAuthEnabled = _serverConfig.value.isAuthEnabled,
-                    authToken = _serverConfig.value.authToken,
-                    onStatsUpdated = { clients, clientIps, down, up ->
-                        val port = _serverConfig.value.port
-                        val currentUrl = _serverStats.value.fullUrl
-                        val effectiveUrl = if (currentUrl.isNotEmpty()) currentUrl else "http://${getPrimaryLanIp() ?: "127.0.0.1"}:$port/"
-                        _serverStats.value = _serverStats.value.copy(
-                            activeClients = clients,
-                            clientIps = clientIps,
-                            bytesDownloaded = down,
-                            bytesUploaded = up
-                        )
-                        // Synchronously push update to Android notification shade in < 0.005s!
-                        LanFileServerService.updateNotification(appContext, effectiveUrl, clients, port, clientIps)
-                    },
-                    onLog = { log ->
-                        addLog(log)
+                    // 1. IP Detection
+                    val primaryIp = getPrimaryLanIp()
+                    if (primaryIp == null) {
+                        withContext(Dispatchers.Main) {
+                            _serverState.value = LanServerState.ERROR
+                            _serverStats.value = _serverStats.value.copy(
+                                errorMessage = "Faol LAN yoki Wi-Fi tarmog'i aniqlanmadi. Iltimos Wi-Fi yoki Hotspot tarmog'ini yoqing."
+                            )
+                        }
+                        return@withLock
                     }
-                )
 
-                // 4. Check if port is bound
-                if (!server.checkPortAvailable(portToUse)) {
-                    withContext(Dispatchers.Main) {
-                        _serverState.value = LanServerState.ERROR
-                        _serverStats.value = _serverStats.value.copy(
-                            errorMessage = "Port $portToUse allaqachon band. Iltimos sozlamalarda boshqa port tanlang (masalan, 8081 yoki 8888)."
-                        )
+                    // 2. Shared directory validation
+                    val sharedDir = File(_serverConfig.value.sharedDirectoryPath)
+                    if (!sharedDir.exists()) {
+                        sharedDir.mkdirs()
                     }
-                    return@launch
-                }
 
-                // 5. Start Server
-                server.start()
-                activeServer = server
-
-                val tokenParam = if (_serverConfig.value.isAuthEnabled) "?token=${_serverConfig.value.authToken}" else ""
-                val fullUrl = "http://$primaryIp:$portToUse/$tokenParam"
-
-                withContext(Dispatchers.Main) {
-                    _serverConfig.value = _serverConfig.value.copy(port = portToUse)
-                    _serverState.value = LanServerState.RUNNING
-                    _serverStats.value = LanServerStats(
-                        ipAddress = primaryIp,
+                    // 3. Create HTTP Server instance
+                    val server = LanFileServer(
                         port = portToUse,
-                        fullUrl = "http://$primaryIp:$portToUse/",
-                        activeClients = 0,
-                        clientIps = emptyList(),
-                        bytesDownloaded = 0L,
-                        bytesUploaded = 0L,
-                        uptimeSeconds = 0L,
-                        errorMessage = null
+                        sharedDirectory = sharedDir,
+                        isAuthEnabled = _serverConfig.value.isAuthEnabled,
+                        authToken = _serverConfig.value.authToken,
+                        onStatsUpdated = { clients, clientIps, down, up ->
+                            val port = _serverConfig.value.port
+                            val currentUrl = _serverStats.value.fullUrl
+                            val effectiveUrl = if (currentUrl.isNotEmpty()) currentUrl else "http://${getPrimaryLanIp() ?: "127.0.0.1"}:$port/"
+                            _serverStats.value = _serverStats.value.copy(
+                                activeClients = clients,
+                                clientIps = clientIps,
+                                bytesDownloaded = down,
+                                bytesUploaded = up
+                            )
+                            // Synchronously push update to Android notification shade in < 0.005s!
+                            LanFileServerService.updateNotification(appContext, effectiveUrl, clients, port, clientIps)
+                        },
+                        onLog = { log ->
+                            addLog(log)
+                        }
                     )
 
-                    // Start Foreground Service
-                    LanFileServerService.startService(appContext)
+                    // 4. Start Server directly (with SO_REUSEADDR and smart bind retry)
+                    server.start()
+                    activeServer = server
 
-                    // Start Uptime ticker
-                    startUptimeTicker()
+                    val tokenParam = if (_serverConfig.value.isAuthEnabled) "?token=${_serverConfig.value.authToken}" else ""
+                    val fullUrl = "http://$primaryIp:$portToUse/$tokenParam"
 
-                    addLog(
-                        LanAccessLog(
-                            clientIp = "127.0.0.1",
-                            method = "START",
-                            path = "Server port $portToUse da ishga tushirildi",
-                            statusCode = 200,
-                            bytesTransferred = 0
+                    withContext(Dispatchers.Main) {
+                        _serverConfig.value = _serverConfig.value.copy(port = portToUse)
+                        _serverState.value = LanServerState.RUNNING
+                        _serverStats.value = LanServerStats(
+                            ipAddress = primaryIp,
+                            port = portToUse,
+                            fullUrl = "http://$primaryIp:$portToUse/",
+                            activeClients = 0,
+                            clientIps = emptyList(),
+                            bytesDownloaded = 0L,
+                            bytesUploaded = 0L,
+                            uptimeSeconds = 0L,
+                            errorMessage = null
                         )
-                    )
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Server start exception", e)
-                withContext(Dispatchers.Main) {
-                    _serverState.value = LanServerState.ERROR
-                    _serverStats.value = _serverStats.value.copy(
-                        errorMessage = e.message ?: "Serverni ishga tushirishda noma'lum xatolik yuz berdi"
-                    )
+
+                        // Start Foreground Service safely
+                        LanFileServerService.startService(appContext)
+
+                        // Start Uptime ticker
+                        startUptimeTicker()
+
+                        addLog(
+                            LanAccessLog(
+                                clientIp = "127.0.0.1",
+                                method = "START",
+                                path = "Server port $portToUse da ishga tushirildi",
+                                statusCode = 200,
+                                bytesTransferred = 0
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Server start exception", e)
+                    withContext(Dispatchers.Main) {
+                        _serverState.value = LanServerState.ERROR
+                        _serverStats.value = _serverStats.value.copy(
+                            errorMessage = e.message ?: "Serverni ishga tushirishda noma'lum xatolik yuz berdi"
+                        )
+                    }
                 }
             }
         }
@@ -215,29 +219,31 @@ class LanFileServerManager private constructor(private val appContext: Context) 
         uptimeJob = null
 
         scope.launch(Dispatchers.IO) {
-            try {
-                activeServer?.stop()
+            serverLifecycleMutex.withLock {
+                try {
+                    activeServer?.stop()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error stopping activeServer", e)
+                }
                 activeServer = null
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping activeServer", e)
-            }
 
-            withContext(Dispatchers.Main) {
-                _serverState.value = LanServerState.STOPPED
-                _serverStats.value = _serverStats.value.copy(
-                    activeClients = 0,
-                    clientIps = emptyList()
-                )
-                LanFileServerService.stopService(appContext)
-                addLog(
-                    LanAccessLog(
-                        clientIp = "127.0.0.1",
-                        method = "STOP",
-                        path = "Server to'xtatildi",
-                        statusCode = 200,
-                        bytesTransferred = 0
+                withContext(Dispatchers.Main) {
+                    _serverState.value = LanServerState.STOPPED
+                    _serverStats.value = _serverStats.value.copy(
+                        activeClients = 0,
+                        clientIps = emptyList()
                     )
-                )
+                    LanFileServerService.stopService(appContext)
+                    addLog(
+                        LanAccessLog(
+                            clientIp = "127.0.0.1",
+                            method = "STOP",
+                            path = "Server to'xtatildi",
+                            statusCode = 200,
+                            bytesTransferred = 0
+                        )
+                    )
+                }
             }
         }
     }
@@ -245,11 +251,15 @@ class LanFileServerManager private constructor(private val appContext: Context) 
     fun restartServer(newPort: Int? = null) {
         val targetPort = newPort ?: _serverConfig.value.port
         scope.launch(Dispatchers.IO) {
-            try {
-                activeServer?.stop()
+            serverLifecycleMutex.withLock {
+                uptimeJob?.cancel()
+                uptimeJob = null
+                try {
+                    activeServer?.stop()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error stopping activeServer during restart", e)
+                }
                 activeServer = null
-            } catch (e: Exception) {
-                Log.e(TAG, "Error stopping activeServer during restart", e)
             }
             withContext(Dispatchers.Main) {
                 setPort(targetPort)
